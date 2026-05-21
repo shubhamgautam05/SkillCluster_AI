@@ -494,7 +494,7 @@ jobs:
     # Environment — enables deployment tracking in GitHub UI
     environment:
       name: production
-      url: http://${{ secrets.PRODUCTION_HOST }}:8501
+      url: https://github.com/${{ github.repository }}
 
     steps:
       - name: 📥 Checkout Repository
