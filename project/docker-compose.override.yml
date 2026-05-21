@@ -1,0 +1,46 @@
+# =============================================================================
+# docker-compose.override.yml — Development Overrides
+# Docker Compose automatically merges this with docker-compose.yml in dev
+# Production ignores this file: docker compose -f docker-compose.yml up
+# =============================================================================
+
+services:
+  skillcluster-app:
+    # In development, override environment for hot-reload and debugging
+    environment:
+      - APP_ENV=development
+      - STREAMLIT_SERVER_RUN_ON_SAVE=true    # Hot reload on file save
+      - STREAMLIT_SERVER_HEADLESS=false       # Show browser in dev
+
+    # Dev bind mount — live code sync (changes reflect instantly without rebuild)
+    volumes:
+      - model-artifacts:/app/output
+      - type: bind
+        source: ./datasets
+        target: /app/datasets
+        read_only: true
+      # EXTRA: mount source code directly for live editing (dev only)
+      - type: bind
+        source: .
+        target: /app
+        read_only: false
+
+    # Relax resource limits during development
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+    # More lenient health check in dev (app may restart frequently)
+    healthcheck:
+      start_period: 30s
+      interval: 60s
+
+volumes:
+  model-artifacts:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${PWD}/output
+      o: bind

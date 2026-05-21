@@ -1,0 +1,179 @@
+# =============================================================================
+# docker-compose.yml — SkillCluster AI Full Stack Orchestration
+# Demonstrates: services, volumes, networks, environment variables,
+# secrets, health checks, resource limits, dependency ordering
+# =============================================================================
+
+# =============================================================================
+# SERVICES — Each service runs in its own isolated container
+# =============================================================================
+services:
+
+  # ── SERVICE 1: SkillCluster AI Application ─────────────────────────────────
+  skillcluster-app:
+    # build field — builds image from local Dockerfile (vs using pre-built image)
+    build:
+      context: .                        # Build context = current directory
+      dockerfile: Dockerfile            # Which Dockerfile to use
+      args:                             # Build-time ARG values
+        PYTHON_VERSION: "3.11"
+        BUILD_ENV: "production"
+      # Cache-from: pull existing image layers from registry to speed up builds
+      cache_from:
+        - "ghcr.io/shubhamgautam05/skillcluster-ai:latest"
+
+    # image field — tag the built image with this name
+    image: skillcluster-ai:latest
+
+    # Container name
+    container_name: skillcluster-app
+
+    # Hostname inside Docker network (DNS name other containers use to reach it)
+    hostname: skillcluster-app
+
+    # Environment variables passed into the container at runtime
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - PYTHONUNBUFFERED=1
+      - APP_ENV=production
+
+    # env_file — load additional environment variables from a file (keeps secrets out of compose)
+    env_file:
+      - .env
+
+    # Port mapping — HOST_PORT:CONTAINER_PORT
+    # Exposes container port 8501 on host port 8501
+    ports:
+      - "8501:8501"
+
+    # Volumes — persistent data that survives container restarts
+    volumes:
+      # Named volume — ML model artifacts (.pkl files)
+      # pipeline.py writes here; app.py reads from here
+      - model-artifacts:/app/output
+
+      # Bind mount — dataset mounted from host (read-only for safety)
+      # The 56MB CSV stays on host, not baked into image
+      - type: bind
+        source: ./datasets
+        target: /app/datasets
+        read_only: true
+
+    # Networks — which Docker networks this service belongs to
+    networks:
+      - skillcluster-network
+
+    # Restart policy — automatically restart on failure
+    restart: unless-stopped
+
+    # Resource limits (cgroups under the hood — Unit I: Control Groups)
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"          # Max 1.5 CPU cores
+          memory: 1536M        # Max 1.5 GB RAM
+        reservations:
+          cpus: "0.5"          # Guaranteed 0.5 CPU cores
+          memory: 512M         # Guaranteed 512 MB RAM
+
+    # Health check — Docker actively monitors if the app is healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s            # Check every 30 seconds
+      timeout: 10s             # Fail if no response within 10 seconds
+      start_period: 90s        # Wait 90s before first check (app startup time)
+      retries: 3               # Mark unhealthy after 3 consecutive failures
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"        # Max log file size
+        max-file: "3"          # Keep last 3 log files
+
+    # Labels — metadata attached to the container
+    labels:
+      - "app=skillcluster-ai"
+      - "version=1.0.0"
+      - "environment=production"
+
+  # ── SERVICE 2: ML Pipeline Runner ──────────────────────────────────────────
+  # This service runs pipeline.py ONCE to generate ML model artifacts
+  # then exits — it's a one-shot init container
+  pipeline-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.11"
+        BUILD_ENV: "production"
+
+    image: skillcluster-ai:latest        # Reuses same image (no rebuild)
+    container_name: pipeline-runner
+
+    # Override CMD to run pipeline instead of streamlit
+    command: ["python", "pipeline.py"]
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    volumes:
+      # Write model artifacts to the SAME named volume the app reads from
+      - model-artifacts:/app/output
+      # Dataset bind mount (read-only)
+      - type: bind
+        source: ./datasets
+        target: /app/datasets
+        read_only: true
+
+    networks:
+      - skillcluster-network
+
+    # Resource limits for ML training job
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"          # More CPU for training
+          memory: 2G
+
+    # Restart policy — never restart (it's a one-shot job)
+    restart: "no"
+
+    # profiles — this service only runs when explicitly called
+    # docker compose --profile pipeline up   ← runs this
+    # docker compose up                      ← skips this (app only)
+    profiles:
+      - pipeline
+
+# =============================================================================
+# VOLUMES — Named volumes managed by Docker (persisted on host)
+# =============================================================================
+volumes:
+  model-artifacts:
+    # Driver options — local driver stores on host filesystem
+    driver: local
+    driver_opts:
+      type: none
+      device: ${PWD}/output      # Maps to ./output on host
+      o: bind
+    labels:
+      - "description=SkillCluster AI trained ML model artifacts"
+
+# =============================================================================
+# NETWORKS — Custom bridge networks for service communication
+# =============================================================================
+networks:
+  skillcluster-network:
+    driver: bridge               # Bridge network — containers communicate via virtual switch
+    name: skillcluster-net       # Explicit name (instead of auto-generated prefix)
+    # DNS is automatic — services reach each other by service name
+    # e.g., pipeline-runner can reach skillcluster-app at http://skillcluster-app:8501
+    labels:
+      - "project=skillcluster-ai"
+    ipam:
+      driver: default
+      config:
+        - subnet: "172.20.0.0/16"   # Custom subnet for the network

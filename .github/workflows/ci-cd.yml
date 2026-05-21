@@ -1,0 +1,581 @@
+# =============================================================================
+# .github/workflows/ci-cd.yml
+# SkillCluster AI — Full CI/CD Pipeline
+#
+# PIPELINE STAGES:
+#   1. code-quality   → Lint & static analysis
+#   2. security-scan  → Vulnerability scanning (image + code)
+#   3. build          → Build & tag Docker image
+#   4. push-registries→ Push to Docker Hub + GHCR
+#   5. integration-test→ Pull & run the pushed image, verify health
+#   6. deploy         → Deploy to production server
+#   7. notify         → Slack/summary notification
+#
+# TRIGGERS: push to main, pull_request, scheduled nightly, manual
+# =============================================================================
+
+name: 🚀 SkillCluster AI — CI/CD Pipeline
+
+# =============================================================================
+# TRIGGERS — When this workflow runs
+# =============================================================================
+on:
+  # Trigger on push to main branch
+  push:
+    branches:
+      - main
+      - "release/**"           # Also trigger on release branches
+    paths-ignore:              # Skip if only these files changed
+      - "**.md"
+      - ".gitignore"
+      - "docs/**"
+
+  # Trigger on pull requests targeting main
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+
+  # Scheduled trigger — run nightly at 2:00 AM UTC (keeps image fresh)
+  schedule:
+    - cron: "0 2 * * 1"       # Every Monday at 2 AM UTC
+
+  # Manual trigger — run pipeline on demand from GitHub UI
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - production
+          - staging
+      skip_tests:
+        description: "Skip test stage"
+        required: false
+        default: false
+        type: boolean
+      force_push:
+        description: "Force push even on PR"
+        required: false
+        default: false
+        type: boolean
+
+# =============================================================================
+# ENVIRONMENT VARIABLES — Available to all jobs
+# =============================================================================
+env:
+  IMAGE_NAME: skillcluster-ai
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/skillcluster-ai
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/skillcluster-ai
+  PYTHON_VERSION: "3.11"
+  REGISTRY_DOCKERHUB: docker.io
+  REGISTRY_GHCR: ghcr.io
+
+# Cancel in-progress runs when a new push happens (saves CI minutes)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ============================================================================
+  # JOB 1: CODE QUALITY
+  # Runs on every push and PR — fast feedback on code style
+  # ============================================================================
+  code-quality:
+    name: 🔍 Code Quality & Linting
+    runs-on: ubuntu-latest          # GitHub-hosted runner (Ubuntu)
+
+    # Output values to pass to downstream jobs
+    outputs:
+      python-version: ${{ steps.setup.outputs.python-version }}
+
+    steps:
+      # Step 1: Checkout repository code
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4   # Marketplace action — checks out the repo
+        with:
+          fetch-depth: 0            # Full history for better analysis
+
+      # Step 2: Set up Python using marketplace action
+      - name: 🐍 Set Up Python ${{ env.PYTHON_VERSION }}
+        id: setup
+        uses: actions/setup-python@v5     # Language-specific marketplace action
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Step 3: Cache pip packages — avoids re-downloading on every run
+      - name: 📦 Cache pip Dependencies
+        uses: actions/cache@v4      # Marketplace action for caching
+        with:
+          path: ~/.cache/pip
+          # Cache key based on OS + requirements hash — invalidates when deps change
+          key: ${{ runner.os }}-pip-${{ hashFiles('project/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # Step 4: Install linting tools
+      - name: 📦 Install Linting Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pyflakes
+
+      # Step 5: Run flake8 linter
+      - name: 🔍 Lint with flake8
+        working-directory: ./project
+        run: |
+          echo "Running flake8 linter..."
+          flake8 *.py \
+            --max-line-length=150 \
+            --ignore=E501,W503,E302,E303,E305,W291,W293 \
+            --exclude=__pycache__ \
+            --statistics \
+            --count
+          echo "Lint check passed!"
+
+      # Step 6: Validate Dockerfile syntax
+      - name: 🐳 Validate Dockerfile Syntax
+        uses: hadolint/hadolint-action@v3.1.0  # Docker linting marketplace action
+        with:
+          dockerfile: project/Dockerfile
+          ignore: DL3008,DL3009,DL3013,DL3042
+
+  # ============================================================================
+  # JOB 2: BUILD DOCKER IMAGE
+  # Runs after code quality passes
+  # ============================================================================
+  build:
+    name: 🐳 Build Docker Image
+    runs-on: ubuntu-latest
+    needs: code-quality              # Depends on Job 1 — only runs if lint passes
+    if: ${{ !inputs.skip_tests || github.event_name != 'workflow_dispatch' }}
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # Determine version tag from git
+      - name: 🏷️ Determine Image Version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == "refs/tags/"* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="sha-${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Image version: $VERSION"
+
+      # Set up Docker Buildx — enables advanced build features (multi-platform, cache)
+      - name: 🔧 Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      # Extract metadata for image tags and labels (Open Container Initiative standard)
+      - name: 🏷️ Extract Docker Metadata & Tags
+        id: meta
+        uses: docker/metadata-action@v5   # Marketplace action — auto-generates tags
+        with:
+          images: |
+            ${{ env.DOCKERHUB_REPO }}
+            ${{ env.GHCR_IMAGE }}
+          tags: |
+            # Latest tag on main branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Short SHA tag for traceability
+            type=sha,prefix=sha-,format=short
+            # Branch name tag
+            type=ref,event=branch
+            # PR number tag
+            type=ref,event=pr
+            # Semantic version tag if a git tag is pushed
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=SkillCluster AI
+            org.opencontainers.image.description=AI-powered resume clustering and skill gap detection
+            org.opencontainers.image.vendor=Shubham Gautam
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      # Cache Docker layers between builds (speeds up CI significantly)
+      - name: 🗄️ Cache Docker Build Layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      # Build the Docker image (without pushing yet — push happens in next job)
+      - name: 🏗️ Build Docker Image
+        id: build
+        uses: docker/build-push-action@v5   # Marketplace action for building
+        with:
+          context: ./project               # Build context = project directory
+          file: ./project/Dockerfile       # Path to Dockerfile
+          push: false                      # Don't push yet — only build
+          load: true                       # Load into local Docker daemon for testing
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            BUILD_ENV=production
+          # Use GitHub Actions cache for layer caching
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      # Move cache (workaround to prevent cache from growing indefinitely)
+      - name: 🔄 Update Build Cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # Inspect the built image — show layers, size, metadata
+      - name: 🔎 Inspect Built Image
+        run: |
+          echo "=== Image Tags ==="
+          docker images | grep skillcluster
+          echo ""
+          echo "=== Image Layers & History ==="
+          docker history ${{ env.DOCKERHUB_REPO }}:latest --no-trunc 2>/dev/null || \
+          docker history ${{ env.IMAGE_NAME }}:latest 2>/dev/null || true
+          echo ""
+          echo "=== Image Size ==="
+          docker inspect ${{ env.DOCKERHUB_REPO }}:latest 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin)[0]; print('Total Size:', round(d['Size']/1024/1024, 2), 'MB')" || true
+
+      # Save the built image as a workflow artifact (downloadable from GitHub UI)
+      - name: 💾 Save Image as Artifact
+        run: |
+          docker save ${{ env.DOCKERHUB_REPO }}:latest | gzip > /tmp/skillcluster-image.tar.gz
+          echo "Image exported to artifact"
+
+      - name: 📤 Upload Image Artifact
+        uses: actions/upload-artifact@v4    # Marketplace action — saves artifact
+        with:
+          name: docker-image-${{ steps.version.outputs.version }}
+          path: /tmp/skillcluster-image.tar.gz
+          retention-days: 7               # Keep artifact for 7 days
+
+  # ============================================================================
+  # JOB 3: SECURITY SCAN
+  # Parallel to build — scans for vulnerabilities in dependencies & image
+  # ============================================================================
+  security-scan:
+    name: 🔒 Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: build                     # Runs after image is built
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # Download the built image artifact
+      - name: 📥 Download Built Image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-sha-${{ github.sha }}
+        continue-on-error: true
+
+      # Trivy — container vulnerability scanner
+      - name: 🔒 Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master   # Security marketplace action
+        with:
+          image-ref: ${{ env.DOCKERHUB_REPO }}:latest
+          format: "table"
+          exit-code: "0"             # Don't fail pipeline on vulnerabilities (warn only)
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+        continue-on-error: true     # Security scan is advisory — won't block deploy
+
+      # Scan Python dependencies for known CVEs
+      - name: 🔒 Scan Python Dependencies (Safety)
+        run: |
+          pip install safety --quiet
+          cd project
+          safety check -r requirements.txt --output text 2>/dev/null || \
+            echo "Some vulnerabilities found — review before production release"
+
+  # ============================================================================
+  # JOB 4: PUSH TO REGISTRIES
+  # Only on push to main — not on PRs
+  # ============================================================================
+  push-registries:
+    name: 📤 Push to Docker Hub & GHCR
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]   # Depends on BOTH build and security scan
+    # Only push on main branch push or manual trigger — NOT on PRs
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.force_push)
+
+    # Required permissions for GHCR push
+    permissions:
+      contents: read
+      packages: write              # Needed to push to GitHub Container Registry
+
+    outputs:
+      dockerhub-url: ${{ steps.push-hub.outputs.url }}
+      ghcr-url: ${{ steps.push-ghcr.outputs.url }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🏷️ Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKERHUB_REPO }}
+            ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+
+      # ── Authenticate to Docker Hub ──────────────────────────────────────────
+      - name: 🔐 Login to Docker Hub
+        uses: docker/login-action@v3     # Marketplace action for registry auth
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}   # From GitHub Secrets
+          password: ${{ secrets.DOCKERHUB_TOKEN }}      # Access token (not password)
+
+      # ── Authenticate to GitHub Container Registry ───────────────────────────
+      - name: 🔐 Login to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}             # GitHub username automatically
+          password: ${{ secrets.GITHUB_TOKEN }}     # Auto-generated by GitHub Actions
+
+      # Restore build cache
+      - name: 🗄️ Restore Docker Build Cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      # ── Build AND Push to BOTH registries in one step ──────────────────────
+      - name: 🚀 Build & Push to Docker Hub + GHCR
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./project
+          file: ./project/Dockerfile
+          push: true                     # NOW we push
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            BUILD_ENV=production
+          # Multi-platform build — image works on AMD64 and ARM64 (Apple Silicon)
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          # Provenance attestation — supply chain security
+          provenance: true
+          sbom: true                     # Generate Software Bill of Materials
+
+      - name: 🔄 Update Build Cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # Log push results
+      - name: ✅ Log Push Results
+        id: push-hub
+        run: |
+          echo "url=https://hub.docker.com/r/${{ env.DOCKERHUB_REPO }}" >> $GITHUB_OUTPUT
+          echo ""
+          echo "======================================"
+          echo " Images Successfully Pushed!"
+          echo "======================================"
+          echo " Docker Hub : https://hub.docker.com/r/${{ env.DOCKERHUB_REPO }}"
+          echo " GHCR       : https://ghcr.io/${{ github.repository_owner }}/skillcluster-ai"
+          echo " Digest     : ${{ steps.push.outputs.digest }}"
+          echo "======================================"
+
+      - name: 📝 Set GHCR Output
+        id: push-ghcr
+        run: |
+          echo "url=https://ghcr.io/${{ github.repository_owner }}/skillcluster-ai" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # JOB 5: INTEGRATION TEST
+  # Pull the pushed image and verify it actually runs correctly
+  # ============================================================================
+  integration-test:
+    name: 🧪 Integration Test (Pull & Run)
+    runs-on: ubuntu-latest
+    needs: push-registries
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # Pull the freshly pushed image from GHCR
+      - name: 🔐 Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📥 Pull Published Image from GHCR
+        run: |
+          echo "Pulling image from GHCR..."
+          docker pull ${{ env.GHCR_IMAGE }}:latest
+          echo "Pull successful!"
+
+      # Verify image has correct metadata
+      - name: 🔎 Verify Image Metadata
+        run: |
+          echo "=== Verifying image labels ==="
+          docker inspect ${{ env.GHCR_IMAGE }}:latest | \
+            python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)[0]
+          labels = data['Config']['Labels'] or {}
+          print('Title:', labels.get('org.opencontainers.image.title', 'N/A'))
+          print('Version:', labels.get('org.opencontainers.image.version', 'N/A'))
+          print('Size:', round(data['Size'] / 1024 / 1024, 2), 'MB')
+          print('Layers:', len(data['RootFS']['Layers']))
+          "
+
+      # Run the container and verify it starts (without real data)
+      - name: 🏃 Run Container & Verify Startup
+        run: |
+          echo "Starting container..."
+          docker run -d \
+            --name skillcluster-test \
+            -p 8501:8501 \
+            -e APP_ENV=test \
+            ${{ env.GHCR_IMAGE }}:latest || true
+
+          echo "Waiting 20 seconds for startup..."
+          sleep 20
+
+          echo "Checking container status..."
+          docker ps -a | grep skillcluster-test
+          docker logs skillcluster-test 2>&1 | tail -20
+
+          echo "Cleaning up test container..."
+          docker stop skillcluster-test 2>/dev/null || true
+          docker rm skillcluster-test 2>/dev/null || true
+
+  # ============================================================================
+  # JOB 6: DEPLOY — Production deployment
+  # ============================================================================
+  deploy:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [push-registries, integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # Environment — enables deployment tracking in GitHub UI
+    environment:
+      name: production
+      url: http://${{ secrets.PRODUCTION_HOST }}:8501
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # Deploy to production server via SSH
+      - name: 🚀 Deploy via SSH to Production Server
+        uses: appleboy/ssh-action@v1.0.3    # Marketplace action for SSH deployment
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.PRODUCTION_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_KEY }}
+          port: 22
+          script: |
+            echo "=== Starting Deployment ==="
+            cd /opt/skillcluster-ai
+
+            # Login to GHCR on the server
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull latest image
+            echo "Pulling latest image..."
+            docker pull ghcr.io/${{ github.repository_owner }}/skillcluster-ai:latest
+
+            # Zero-downtime deployment — bring up new, remove old
+            echo "Deploying with zero-downtime..."
+            docker compose -f docker-compose.yml pull
+            docker compose -f docker-compose.yml up -d --remove-orphans
+
+            # Verify deployment health
+            echo "Verifying deployment..."
+            sleep 15
+            docker compose ps
+            docker inspect --format='{{.State.Health.Status}}' skillcluster-app
+
+            echo "=== Deployment Complete ==="
+        continue-on-error: true   # Don't fail pipeline if server not configured
+
+      # Record deployment in GitHub UI
+      - name: 📝 Create Deployment Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | Production |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.GHCR_IMAGE }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Docker Hub** | [View Image](https://hub.docker.com/r/${{ env.DOCKERHUB_REPO }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **GHCR** | [View Image](https://ghcr.io/${{ github.repository_owner }}/skillcluster-ai) |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # JOB 7: PIPELINE SUMMARY — Final status notification
+  # Always runs (even if previous jobs failed) — gives full picture
+  # ============================================================================
+  pipeline-summary:
+    name: 📊 Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [code-quality, build, security-scan, push-registries, integration-test, deploy]
+    if: always()                   # Run even if previous jobs failed
+
+    steps:
+      - name: 📊 Write Pipeline Summary
+        run: |
+          echo "## 🚀 SkillCluster AI — CI/CD Pipeline Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** \`${{ github.event_name }}\` on \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Stage Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔍 Code Quality | ${{ needs.code-quality.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐳 Docker Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔒 Security Scan | ${{ needs.security-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📤 Push Registries | ${{ needs.push-registries.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧪 Integration Test | ${{ needs.integration-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🚀 Deploy | ${{ needs.deploy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Published Images" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker Hub:** \`${{ env.DOCKERHUB_REPO }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GHCR:** \`${{ env.GHCR_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY

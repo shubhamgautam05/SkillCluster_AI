@@ -1,0 +1,12 @@
+# SkillCluster AI — Docker-specific requirements
+# Cleaned version: removed unused packages (sentence-transformers, spacy, matplotlib)
+# sentence-transformers pulls PyTorch (~1GB) and is not used in the codebase
+
+pandas
+numpy
+scikit-learn
+nltk
+plotly
+streamlit
+joblib
+streamlit-option-menu
