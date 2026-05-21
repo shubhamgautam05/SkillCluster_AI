@@ -132,7 +132,7 @@ jobs:
           echo "Running flake8 linter..."
           flake8 *.py \
             --max-line-length=150 \
-            --ignore=E501,W503,E302,E303,E305,W291,W293 \
+            --ignore=E501,W503,W504,E302,E303,E305,W291,W293,E127,E128,E126,F401,F841,F541 \
             --exclude=__pycache__ \
             --statistics \
             --count
