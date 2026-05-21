@@ -67,7 +67,7 @@ on:
 # =============================================================================
 env:
   IMAGE_NAME: skillcluster-ai
-  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/skillcluster-ai
+  DOCKERHUB_REPO: shubhamgautam05/skillcluster-ai
   GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/skillcluster-ai
   PYTHON_VERSION: "3.11"
   REGISTRY_DOCKERHUB: docker.io
@@ -492,9 +492,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     # Environment — enables deployment tracking in GitHub UI
-    environment:
-      name: production
-      url: https://github.com/${{ github.repository }}
+    # environment block removed to avoid requiring GitHub environment setup
 
     steps:
       - name: 📥 Checkout Repository
