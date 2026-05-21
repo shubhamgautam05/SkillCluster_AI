@@ -77,7 +77,7 @@ RUN groupadd --gid 1001 appgroup && \
 # RUN — pre-create Streamlit credentials to suppress interactive email prompt
 # Without this, Streamlit blocks startup waiting for user input inside Docker
 RUN mkdir -p /home/appuser/.streamlit && \
-    echo '[general]\nemail = ""' > /home/appuser/.streamlit/credentials.toml && \
+    printf '[general]\nemail = ""\n' > /home/appuser/.streamlit/credentials.toml && \
     chown -R appuser:appgroup /home/appuser/.streamlit
 
 # COPY dependencies from builder stage (this is the multi-stage transfer)
